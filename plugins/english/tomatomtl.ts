@@ -8,11 +8,17 @@ class TomatoMTL implements Plugin.PluginBase {
   id = 'tomatomtl';
   name = 'TomatoMTL';
   site = 'https://tomatomtl.com';
-  version = '1.0.2';
+  version = '1.0.3';
   icon = 'src/en/tomatomtl/icon.png';
   // TomatoMTL uses browser storage for its catalogue cache. Keeping this flag
   // enabled also makes the source compatible with LNReader's web-backed flow.
   webStorageUtilized = true;
+
+  // TomatoMTL rate-limits rapid chapter requests. LNReader can ask for
+  // multiple chapters at the same time when downloading a range, so keep
+  // the entire chapter pipeline (fetch -> decrypt -> translate) sequential.
+  private chapterQueue: Promise<void> = Promise.resolve();
+  private lastChapterFinishedAt = 0;
 
   private absolute(path: string): string {
     return new URL(path, this.site).toString();
@@ -26,6 +32,7 @@ class TomatoMTL implements Plugin.PluginBase {
   ): Promise<Response> {
     let lastStatus = 0;
     let lastError: unknown;
+    let lastRetryAfter: string | null = null;
 
     for (let attempt = 0; attempt < retries; attempt++) {
       try {
@@ -36,6 +43,7 @@ class TomatoMTL implements Plugin.PluginBase {
         if (response.ok) return response;
 
         lastStatus = response.status;
+        lastRetryAfter = response.headers?.get?.('Retry-After') ?? null;
         // TomatoMTL was observed returning 503 once and succeeding on retry.
         if (![408, 425, 429, 500, 502, 503, 504].includes(response.status)) {
           return response;
@@ -45,9 +53,29 @@ class TomatoMTL implements Plugin.PluginBase {
       }
 
       if (attempt + 1 < retries) {
-        await new Promise((resolve) =>
-          setTimeout(resolve, Math.min(750 * 2 ** attempt, 6000)),
-        );
+        let delayMs = Math.min(750 * 2 ** attempt, 6000);
+
+        // 429 means the server is explicitly rate-limiting us. If TomatoMTL
+        // supplies Retry-After, obey it; otherwise use a much slower backoff
+        // than for ordinary transient 5xx errors.
+        if (lastStatus === 429) {
+          const retryAfter = lastRetryAfter;
+          if (retryAfter) {
+            const seconds = Number(retryAfter);
+            if (Number.isFinite(seconds)) {
+              delayMs = Math.min(Math.max(seconds * 1000, 1500), 60000);
+            } else {
+              const dateMs = Date.parse(retryAfter) - Date.now();
+              if (Number.isFinite(dateMs) && dateMs > 0) {
+                delayMs = Math.min(Math.max(dateMs, 1500), 60000);
+              }
+            }
+          } else {
+            delayMs = Math.min(5000 * 2 ** attempt, 60000);
+          }
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
       }
     }
 
@@ -443,6 +471,33 @@ class TomatoMTL implements Plugin.PluginBase {
   }
 
   async parseChapter(chapterPath: string): Promise<string> {
+    const run = async () => {
+      const now = Date.now();
+      const spacing = 1500 - (now - this.lastChapterFinishedAt);
+      if (spacing > 0) await new Promise((resolve) => setTimeout(resolve, spacing));
+
+      try {
+        return await this.parseChapterNow(chapterPath);
+      } finally {
+        this.lastChapterFinishedAt = Date.now();
+      }
+    };
+
+    // Every download request waits for the previous chapter to finish.
+    // This prevents LNReader's parallel download queue from triggering
+    // TomatoMTL's anti-abuse/rate-limit protection.
+    const previous = this.chapterQueue;
+    let release!: () => void;
+    this.chapterQueue = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      return await run();
+    } finally {
+      release();
+    }
+  }
+
+  private async parseChapterNow(chapterPath: string): Promise<string> {
     const url = this.absolute(chapterPath);
     const response = await this.request(url);
     const html = await response.text();
@@ -460,7 +515,6 @@ class TomatoMTL implements Plugin.PluginBase {
     const english = await this.translateToEnglish(rawText);
     if (!english.trim()) throw new Error('TomatoMTL chapter translation was empty.');
 
-    // Preserve paragraph boundaries for LNReader's reader.
     return english
       .split(/\n+/)
       .map((line) => `<p>${this.escapeHTML(line)}</p>`)

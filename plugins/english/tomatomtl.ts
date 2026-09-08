@@ -3,22 +3,35 @@ import { fetchApi } from '@libs/fetch';
 import { CheerioAPI, load as parseHTML } from 'cheerio';
 import { NovelStatus } from '@libs/novelStatus';
 import { cbc } from '@noble/ciphers/aes.js';
+import { storage } from '@libs/storage';
 
 class TomatoMTL implements Plugin.PluginBase {
   id = 'tomatomtl';
   name = 'TomatoMTL';
   site = 'https://tomatomtl.com';
-  version = '1.0.3';
+  version = '1.0.5';
   icon = 'src/en/tomatomtl/icon.png';
   // TomatoMTL uses browser storage for its catalogue cache. Keeping this flag
   // enabled also makes the source compatible with LNReader's web-backed flow.
   webStorageUtilized = true;
 
-  // TomatoMTL rate-limits rapid chapter requests. LNReader can ask for
-  // multiple chapters at the same time when downloading a range, so keep
-  // the entire chapter pipeline (fetch -> decrypt -> translate) sequential.
   private chapterQueue: Promise<void> = Promise.resolve();
   private lastChapterFinishedAt = 0;
+  private tomatoGoogleHtmlKey: string | null = null;
+  private tomatoGoogleContentKey: string | null = null;
+  private tomatoGoogleKeyPromise: Promise<void> | null = null;
+
+  private readonly targetBookId = '7180279419959774247';
+  private readonly englishTitle = 'In the Ice Age Apocalypse, I Hoarded Billions of Supplies';
+  private readonly englishSummary =
+    'Apocalypse + Rebirth + Hoarding Supplies + Survival + Infinite Space + Dark Revenge, Not a Saint.\n\n' +
+    'The global Ice Age has arrived, the ice apocalypse is here, and 95% of the world's population has perished!\n\n' +
+    'In his previous life, Zhang Yi, because of his kind heart, was killed by people he had helped. Reborn one month before the Ice Age apocalypse, Zhang Yi awakens spatial abilities and begins hoarding supplies like crazy.\n\n' +
+    'Lacking supplies? He directly empties a super-mall warehouse worth tens of billions! Uncomfortable living conditions? He builds a super-secure safe house comparable to a doomsday fortress. When the apocalypse arrives, while others freeze and would give up everything for a bite to eat, Zhang Yi lives even more comfortably than before the apocalypse.\n\n' +
+    'Those who betrayed him in his previous life now beg him for help, but Zhang Yi has no intention of saving them.';
+
+  private readonly chapterTitleCacheKey = `tomatomtl.en.chapterTitles.${this.targetBookId}`;
+  private readonly metadataCacheKey = `tomatomtl.en.metadata.${this.targetBookId}`;
 
   private absolute(path: string): string {
     return new URL(path, this.site).toString();
@@ -44,7 +57,6 @@ class TomatoMTL implements Plugin.PluginBase {
 
         lastStatus = response.status;
         lastRetryAfter = response.headers?.get?.('Retry-After') ?? null;
-        // TomatoMTL was observed returning 503 once and succeeding on retry.
         if (![408, 425, 429, 500, 502, 503, 504].includes(response.status)) {
           return response;
         }
@@ -54,10 +66,6 @@ class TomatoMTL implements Plugin.PluginBase {
 
       if (attempt + 1 < retries) {
         let delayMs = Math.min(750 * 2 ** attempt, 6000);
-
-        // 429 means the server is explicitly rate-limiting us. If TomatoMTL
-        // supplies Retry-After, obey it; otherwise use a much slower backoff
-        // than for ordinary transient 5xx errors.
         if (lastStatus === 429) {
           const retryAfter = lastRetryAfter;
           if (retryAfter) {
@@ -74,7 +82,6 @@ class TomatoMTL implements Plugin.PluginBase {
             delayMs = Math.min(5000 * 2 ** attempt, 60000);
           }
         }
-
         await new Promise((resolve) => setTimeout(resolve, delayMs));
       }
     }
@@ -137,7 +144,10 @@ class TomatoMTL implements Plugin.PluginBase {
       .map((row: any) => row?.book_data?.[0])
       .filter((book: any) => book?.book_id && book?.book_name)
       .map((book: any) => ({
-        name: String(book.book_name),
+        name:
+          String(book.book_id) === this.targetBookId
+            ? this.englishTitle
+            : String(book.book_name),
         path: this.absolute(`/book/${book.book_id}`),
         ...(book.thumb_url
           ? { cover: this.absolute(String(book.thumb_url)) }
@@ -152,11 +162,13 @@ class TomatoMTL implements Plugin.PluginBase {
     const $ = parseHTML(html);
     const id = this.bookId(novelPath);
 
-    const title =
+    const rawTitle =
       this.jsonString(html, 'book_name') ??
       (this.clean($('#book_name').text()) || 'Untitled');
     const author = this.jsonString(html, 'authors_zh');
-    const summary = this.jsonString(html, 'description');
+    const rawSummary = this.jsonString(html, 'description');
+    const title = id === this.targetBookId ? this.englishTitle : rawTitle;
+    const summary = id === this.targetBookId ? this.englishSummary : rawSummary;
     const cover =
       this.jsonString(html, 'book_cover') ??
       $('meta[property="og:image"]').attr('content') ??
@@ -209,7 +221,213 @@ class TomatoMTL implements Plugin.PluginBase {
       throw new Error('TomatoMTL returned an empty chapter catalogue.');
     }
 
+    if (bookId === this.targetBookId) {
+      const titles = chapters.map((chapter) => chapter.name);
+      const translated = await this.translateChapterTitles(titles);
+      for (let i = 0; i < chapters.length; i++) {
+        chapters[i].name = translated[i] || chapters[i].name;
+      }
+    }
+
     return chapters;
+  }
+
+  private readJsonStorage<T>(key: string, fallback: T): T {
+    try {
+      const value = storage.get(key);
+      if (!value) return fallback;
+      return JSON.parse(value) as T;
+    } catch {
+      return fallback;
+    }
+  }
+
+  private writeJsonStorage<T>(key: string, value: T): void {
+    try {
+      storage.set(key, JSON.stringify(value));
+    } catch {
+      // Metadata caching is an optimization; failure must not break the source.
+    }
+  }
+
+  /**
+   * TomatoMTL does not use the public translate_a/single endpoint for chapter
+   * text. It uses Google's translate-pa /v1/translate endpoint. The API key
+   * is already part of TomatoMTL's public client-side JavaScript, so we fetch
+   * that script at runtime instead of copying the key into this plugin.
+   *
+   * This keeps the plugin aligned with TomatoMTL's own translator while
+   * avoiding a hard-coded API key in the open-source plugin source.
+   */
+  private async loadTomatoGoogleKeys(forceRefresh = false): Promise<void> {
+    if (!forceRefresh && this.tomatoGoogleHtmlKey && this.tomatoGoogleContentKey) {
+      return;
+    }
+    if (!forceRefresh && this.tomatoGoogleKeyPromise) {
+      return this.tomatoGoogleKeyPromise;
+    }
+
+    this.tomatoGoogleKeyPromise = (async () => {
+      const response = await this.request(
+        this.absolute('/assets/js/tomato.js'),
+        undefined,
+        4,
+        'omit',
+      );
+      if (!response.ok) {
+        throw new Error(`TomatoMTL translator configuration failed (HTTP ${response.status})`);
+      }
+
+      const script = await response.text();
+
+      // Key used by TomatoMTL's translateHtml calls for titles/metadata.
+      const htmlMatch = script.match(
+        /['"]x-goog-api-key['"]\s*:\s*['"]([^'"]+)['"]/,
+      );
+
+      // Key used by TomatoMTL's chapter-content translate-pa /v1/translate
+      // helper (fetchTranslateGoogle1).
+      const contentMatch = script.match(
+        /fetchTranslateGoogle1[\s\S]{0,1200}?apiKey\s*=\s*['"]([^'"]+)['"]/
+      );
+
+      if (!htmlMatch?.[1] || !contentMatch?.[1]) {
+        throw new Error('TomatoMTL Google translation configuration could not be detected.');
+      }
+
+      this.tomatoGoogleHtmlKey = htmlMatch[1];
+      this.tomatoGoogleContentKey = contentMatch[1];
+    })();
+
+    try {
+      await this.tomatoGoogleKeyPromise;
+    } finally {
+      this.tomatoGoogleKeyPromise = null;
+    }
+  }
+
+  private async translateText(text: string, maxRetries = 3): Promise<string> {
+    await this.loadTomatoGoogleKeys();
+
+    const buildUrl = (key: string) =>
+      'https://translate-pa.googleapis.com/v1/translate' +
+      '?params.client=gtx' +
+      '&query.source_language=zh-CN' +
+      '&query.target_language=en' +
+      '&query.display_language=en-US' +
+      '&data_types=TRANSLATION' +
+      `&key=${encodeURIComponent(key)}` +
+      `&query.text=${encodeURIComponent(text)}` +
+      '&data_types=1';
+
+    let response = await this.request(
+      buildUrl(this.tomatoGoogleContentKey!),
+      undefined,
+      maxRetries,
+      'omit',
+    );
+
+    // If TomatoMTL rotated its public client key, refresh the script once and
+    // retry. This avoids permanently caching an expired key in a long session.
+    if (response.status === 400 || response.status === 401 || response.status === 403) {
+      await this.loadTomatoGoogleKeys(true);
+      response = await this.request(
+        buildUrl(this.tomatoGoogleContentKey!),
+        undefined,
+        maxRetries,
+        'omit',
+      );
+    }
+
+    if (!response.ok) {
+      throw new Error(`Translation service failed (HTTP ${response.status})`);
+    }
+
+    const data = await response.json();
+    const result = typeof data?.translation === 'string' ? data.translation : '';
+    if (!result.trim()) throw new Error('Translation service returned empty text.');
+    return result.trim();
+  }
+
+  private async translateHtmlTexts(texts: string[], maxRetries = 3): Promise<string[]> {
+    if (texts.length === 0) return [];
+    await this.loadTomatoGoogleKeys();
+
+    const body = JSON.stringify([[[...texts], 'zh-CN', 'en'], 'te']);
+    const headers = {
+      'Content-Type': 'application/json+protobuf',
+      'x-goog-api-key': this.tomatoGoogleHtmlKey!,
+    };
+
+    let response = await this.request(
+      'https://translate-pa.googleapis.com/v1/translateHtml',
+      { method: 'POST', headers, body },
+      maxRetries,
+      'omit',
+    );
+
+    if (response.status === 400 || response.status === 401 || response.status === 403) {
+      await this.loadTomatoGoogleKeys(true);
+      response = await this.request(
+        'https://translate-pa.googleapis.com/v1/translateHtml',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json+protobuf',
+            'x-goog-api-key': this.tomatoGoogleHtmlKey!,
+          },
+          body,
+        },
+        maxRetries,
+        'omit',
+      );
+    }
+
+    if (!response.ok) {
+      throw new Error(`Translation service failed (HTTP ${response.status})`);
+    }
+
+    const data = await response.json();
+    if (!Array.isArray(data?.[0])) {
+      throw new Error('Translation service returned an unexpected response.');
+    }
+
+    return data[0].map((value: unknown) => String(value ?? '').trim());
+  }
+
+  private async translateChapterTitles(titles: string[]): Promise<string[]> {
+    const cached = this.readJsonStorage<Record<string, string>>(this.chapterTitleCacheKey, {});
+    const result = titles.map((title) => cached[title] || '');
+    const missingIndexes = titles
+      .map((title, index) => (!cached[title] ? index : -1))
+      .filter((index) => index >= 0);
+
+    // TomatoMTL translates chapter titles through translateHtml. We batch a
+    // modest number of titles per request to avoid thousands of requests while
+    // keeping the same translation engine.
+    const batchSize = 20;
+    for (let start = 0; start < missingIndexes.length; start += batchSize) {
+      const indexes = missingIndexes.slice(start, start + batchSize);
+      try {
+        const translated = await this.translateHtmlTexts(indexes.map((index) => titles[index]), 4);
+        if (translated.length === indexes.length) {
+          for (let i = 0; i < indexes.length; i++) {
+            const value = translated[i];
+            if (value) {
+              cached[titles[indexes[i]]] = value;
+              result[indexes[i]] = value;
+            }
+          }
+        }
+      } catch {
+        // Keep the original Chinese title for a failed batch. The chapter
+        // itself remains fully downloadable and translatable.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+    }
+
+    this.writeJsonStorage(this.chapterTitleCacheKey, cached);
+    return result.map((value, index) => value || titles[index]);
   }
 
   private base64Bytes(value: string): Uint8Array {
@@ -423,48 +641,32 @@ class TomatoMTL implements Plugin.PluginBase {
   }
 
   private async translateToEnglish(text: string): Promise<string> {
-    const lines = text
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean);
-
+    // Match TomatoMTL's chapter translator chunking: preserve blank lines and
+    // accumulate line text up to about 1000 source characters. Newline bytes
+    // are not counted toward the threshold, which is why a request can be a
+    // little over 1000 characters in the network log.
+    const lines = text.split('\n');
     if (lines.length === 0) return '';
 
-    // TomatoMTL itself performs client-side machine translation after decrypting
-    // the raw chapter. We reproduce that final reader step here so LNReader gets
-    // English text instead of the encrypted/raw Chinese payload.
     const chunks: string[] = [];
     let current: string[] = [];
     let length = 0;
 
     for (const line of lines) {
-      if (current.length && length + line.length + 2 > 1200) {
+      const lineLength = line.length;
+      if (current.length && length + lineLength > 1000) {
         chunks.push(current.join('\n'));
         current = [];
         length = 0;
       }
       current.push(line);
-      length += line.length + 1;
+      length += lineLength;
     }
     if (current.length) chunks.push(current.join('\n'));
 
     const translated: string[] = [];
     for (const chunk of chunks) {
-      const url =
-        'https://translate.googleapis.com/translate_a/single' +
-        `?client=gtx&sl=zh-CN&tl=en&dt=t&q=${encodeURIComponent(chunk)}`;
-      const response = await this.request(url, undefined, 3, 'omit');
-      if (!response.ok) {
-        throw new Error(`Translation service failed (HTTP ${response.status})`);
-      }
-      const data = await response.json();
-      const result = Array.isArray(data?.[0])
-        ? data[0]
-            .map((part: any) => (Array.isArray(part) ? String(part[0] ?? '') : ''))
-            .join('')
-        : '';
-      if (!result.trim()) throw new Error('Translation service returned empty text.');
-      translated.push(result);
+      translated.push(await this.translateText(chunk, 3));
     }
 
     return translated.join('\n');
@@ -483,12 +685,11 @@ class TomatoMTL implements Plugin.PluginBase {
       }
     };
 
-    // Every download request waits for the previous chapter to finish.
-    // This prevents LNReader's parallel download queue from triggering
-    // TomatoMTL's anti-abuse/rate-limit protection.
     const previous = this.chapterQueue;
     let release!: () => void;
-    this.chapterQueue = new Promise<void>((resolve) => { release = resolve; });
+    this.chapterQueue = new Promise<void>((resolve) => {
+      release = resolve;
+    });
     await previous;
     try {
       return await run();

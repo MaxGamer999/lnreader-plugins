@@ -9,7 +9,7 @@ class TomatoMTL implements Plugin.PluginBase {
   id = 'tomatomtl';
   name = 'TomatoMTL';
   site = 'https://tomatomtl.com';
-  version = '1.0.7';
+  version = '1.0.8';
   icon = 'src/en/tomatomtl/icon.png';
   // TomatoMTL uses browser storage for its catalogue cache. Keeping this flag
   // enabled also makes the source compatible with LNReader's web-backed flow.
@@ -25,7 +25,7 @@ class TomatoMTL implements Plugin.PluginBase {
   private readonly englishTitle = 'In the Ice Age Apocalypse, I Hoarded Billions of Supplies';
   private readonly englishSummary =
     'Apocalypse + Rebirth + Hoarding Supplies + Survival + Infinite Space + Dark Revenge, Not a Saint.\n\n' +
-    'The global Ice Age has arrived, the ice apocalypse is here, and 95% of the world's population has perished!\n\n' +
+    'The global Ice Age has arrived, the ice apocalypse is here, and 95% of the world\'s population has perished!\n\n' +
     'In his previous life, Zhang Yi, because of his kind heart, was killed by people he had helped. Reborn one month before the Ice Age apocalypse, Zhang Yi awakens spatial abilities and begins hoarding supplies like crazy.\n\n' +
     'Lacking supplies? He directly empties a super-mall warehouse worth tens of billions! Uncomfortable living conditions? He builds a super-secure safe house comparable to a doomsday fortress. When the apocalypse arrives, while others freeze and would give up everything for a bite to eat, Zhang Yi lives even more comfortably than before the apocalypse.\n\n' +
     'Those who betrayed him in his previous life now beg him for help, but Zhang Yi has no intention of saving them.';

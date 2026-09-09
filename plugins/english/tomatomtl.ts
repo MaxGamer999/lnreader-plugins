@@ -9,7 +9,7 @@ class TomatoMTL implements Plugin.PluginBase {
   id = 'tomatomtl';
   name = 'TomatoMTL';
   site = 'https://tomatomtl.com';
-  version = '1.0.5';
+  version = '1.0.7';
   icon = 'src/en/tomatomtl/icon.png';
   // TomatoMTL uses browser storage for its catalogue cache. Keeping this flag
   // enabled also makes the source compatible with LNReader's web-backed flow.
@@ -25,13 +25,14 @@ class TomatoMTL implements Plugin.PluginBase {
   private readonly englishTitle = 'In the Ice Age Apocalypse, I Hoarded Billions of Supplies';
   private readonly englishSummary =
     'Apocalypse + Rebirth + Hoarding Supplies + Survival + Infinite Space + Dark Revenge, Not a Saint.\n\n' +
-    "The global Ice Age has arrived, the ice apocalypse is here, and 95% of the world's population has perished!\n\n" +
+    'The global Ice Age has arrived, the ice apocalypse is here, and 95% of the world's population has perished!\n\n' +
     'In his previous life, Zhang Yi, because of his kind heart, was killed by people he had helped. Reborn one month before the Ice Age apocalypse, Zhang Yi awakens spatial abilities and begins hoarding supplies like crazy.\n\n' +
     'Lacking supplies? He directly empties a super-mall warehouse worth tens of billions! Uncomfortable living conditions? He builds a super-secure safe house comparable to a doomsday fortress. When the apocalypse arrives, while others freeze and would give up everything for a bite to eat, Zhang Yi lives even more comfortably than before the apocalypse.\n\n' +
     'Those who betrayed him in his previous life now beg him for help, but Zhang Yi has no intention of saving them.';
 
   private readonly chapterTitleCacheKey = `tomatomtl.en.chapterTitles.${this.targetBookId}`;
   private readonly metadataCacheKey = `tomatomtl.en.metadata.${this.targetBookId}`;
+  private readonly fanqieReleaseTimesCacheKey = `tomatomtl.fanqie.releaseTimes.${this.targetBookId}`;
 
   private absolute(path: string): string {
     return new URL(path, this.site).toString();
@@ -189,6 +190,107 @@ class TomatoMTL implements Plugin.PluginBase {
     };
   }
 
+  /**
+   * Fanqie exposes the original chapter publication timestamp as
+   * `firstPassTime` (Unix seconds) in its directory response. TomatoMTL's
+   * catalogue does not expose that field, so we retrieve the metadata from
+   * Fanqie and attach it to the corresponding LNReader ChapterItem.
+   *
+   * This is deliberately best-effort: if Fanqie is unavailable, TomatoMTL
+   * chapters still load normally without release dates.
+   */
+  private async fetchFanqieReleaseTimes(
+    bookId: string,
+  ): Promise<Record<string, string>> {
+    if (bookId !== this.targetBookId) return {};
+
+    const cached = this.readJsonStorage<{
+      fetchedAt: number;
+      releaseTimes: Record<string, string>;
+    } | null>(this.fanqieReleaseTimesCacheKey, null);
+    if (
+      cached &&
+      cached.fetchedAt > 0 &&
+      Date.now() - cached.fetchedAt < 30 * 60 * 1000 &&
+      Object.keys(cached.releaseTimes).length > 0
+    ) {
+      return cached.releaseTimes;
+    }
+
+    try {
+      const url = `https://fanqienovel.com/api/reader/directory/detail?bookId=${encodeURIComponent(bookId)}`;
+      const response = await this.request(url, undefined, 3, 'omit');
+      if (!response.ok) {
+        console.warn(`Fanqie directory metadata failed (HTTP ${response.status})`);
+        return {};
+      }
+
+      const data = await response.json();
+      const volumes = data?.data?.chapterListWithVolume;
+      if (!Array.isArray(volumes)) return {};
+
+      const releaseTimes: Record<string, string> = {};
+
+      for (const volume of volumes) {
+        if (!Array.isArray(volume)) continue;
+        for (const item of volume) {
+          const firstPassTime = Number(item?.firstPassTime);
+          if (!item?.itemId || !Number.isFinite(firstPassTime) || firstPassTime <= 0) {
+            continue;
+          }
+
+          const iso = new Date(firstPassTime * 1000).toISOString();
+          const itemId = String(item.itemId);
+          releaseTimes[`id:${itemId}`] = iso;
+
+          const title = this.clean(String(item.title ?? ''));
+          if (title) releaseTimes[`title:${title}`] = iso;
+
+          const order = String(item.realChapterOrder ?? '');
+          if (order) releaseTimes[`order:${order}`] = iso;
+
+          const chapterMatch = title.match(/第\s*(\d+)\s*章/);
+          if (chapterMatch) {
+            releaseTimes[`chapter:${chapterMatch[1]}`] = iso;
+          }
+        }
+      }
+
+      if (Object.keys(releaseTimes).length > 0) {
+        this.writeJsonStorage(this.fanqieReleaseTimesCacheKey, {
+          fetchedAt: Date.now(),
+          releaseTimes,
+        });
+      }
+
+      return releaseTimes;
+    } catch (error) {
+      console.warn('Unable to retrieve Fanqie chapter release times:', error);
+      return {};
+    }
+  }
+
+  private getChapterReleaseTime(
+    item: any,
+    releaseTimes: Record<string, string>,
+    chapterNumber: number,
+  ): string | undefined {
+    const id = item?.id ? releaseTimes[`id:${String(item.id)}`] : undefined;
+    if (id) return id;
+
+    const title = this.clean(String(item?.title ?? ''));
+    const byTitle = title ? releaseTimes[`title:${title}`] : undefined;
+    if (byTitle) return byTitle;
+
+    const chapterMatch = title.match(/第\s*(\d+)\s*章/);
+    if (chapterMatch) {
+      const byChapter = releaseTimes[`chapter:${chapterMatch[1]}`];
+      if (byChapter) return byChapter;
+    }
+
+    return releaseTimes[`order:${chapterNumber}`];
+  }
+
   private async fetchChapters(bookId: string): Promise<Plugin.ChapterItem[]> {
     const response = await this.request(this.absolute(`/catalog/${bookId}`));
     if (!response.ok) {
@@ -200,6 +302,11 @@ class TomatoMTL implements Plugin.PluginBase {
       throw new Error('TomatoMTL returned an unexpected catalogue format.');
     }
 
+    // Fetch the Fanqie timestamps before constructing the final chapter list.
+    // The timestamp is mapped by Fanqie itemId first, then by exact title, and
+    // finally by chapter number as a compatibility fallback.
+    const releaseTimes = await this.fetchFanqieReleaseTimes(bookId);
+
     const chapters: Plugin.ChapterItem[] = [];
     const seen = new Set<string>();
 
@@ -210,10 +317,18 @@ class TomatoMTL implements Plugin.PluginBase {
       if (seen.has(chapterId)) continue;
       seen.add(chapterId);
 
+      const chapterNumber = i + 1;
+      const releaseTime = this.getChapterReleaseTime(
+        item,
+        releaseTimes,
+        chapterNumber,
+      );
+
       chapters.push({
         name: this.clean(String(item.title)),
         path: this.absolute(`/book/${bookId}/${chapterId}`),
-        chapterNumber: i + 1,
+        chapterNumber,
+        ...(releaseTime ? { releaseTime } : {}),
       });
     }
 
@@ -640,36 +755,150 @@ class TomatoMTL implements Plugin.PluginBase {
     }
   }
 
-  private async translateToEnglish(text: string): Promise<string> {
-    // Match TomatoMTL's chapter translator chunking: preserve blank lines and
-    // accumulate line text up to about 1000 source characters. Newline bytes
-    // are not counted toward the threshold, which is why a request can be a
-    // little over 1000 characters in the network log.
-    const lines = text.split('\n');
-    if (lines.length === 0) return '';
+  /**
+   * Reproduce TomatoMTL's current Google chapter-translation pipeline as
+   * closely as possible.
+   *
+   * TomatoMTL does NOT simply translate the decrypted string as-is. Its
+   * client first removes blank lines, rejoins paragraphs with double newlines,
+   * splits with the same line-aware 1000-character helper, then sends each
+   * chunk to /v1/translate. It also retries translation when Google leaves a
+   * run of source lines unchanged.
+   */
+  private splitTomatoText(text: string, maxLength: number): string[] {
+    const lines = text
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
 
     const chunks: string[] = [];
-    let current: string[] = [];
-    let length = 0;
+    let current = '';
 
     for (const line of lines) {
-      const lineLength = line.length;
-      if (current.length && length + lineLength > 1000) {
-        chunks.push(current.join('\n'));
-        current = [];
-        length = 0;
+      const separator = current ? '\n' : '';
+      if (current.length + separator.length + line.length < maxLength) {
+        current += separator + line;
+      } else {
+        if (current) chunks.push(current);
+        current = line;
       }
-      current.push(line);
-      length += lineLength;
-    }
-    if (current.length) chunks.push(current.join('\n'));
-
-    const translated: string[] = [];
-    for (const chunk of chunks) {
-      translated.push(await this.translateText(chunk, 3));
     }
 
-    return translated.join('\n');
+    if (current) chunks.push(current);
+    return chunks;
+  }
+
+  private async translateTomatoGoogle1(text: string, maxRetries = 3): Promise<string> {
+    // TomatoMTL's translateGoogle1() converts each paragraph separator to a
+    // double newline before calling fetchTranslateGoogle1().
+    const input = text
+      .split('\n')
+      .filter((line) => line.trim() !== '')
+      .join('\n\n');
+
+    if (!input.trim()) return '';
+    return this.translateText(input, maxRetries);
+  }
+
+  private normalizeTranslationLines(text: string): string[] {
+    return text
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line !== '');
+  }
+
+  private findUntranslatedRuns(sourceLines: string[], translatedLines: string[]) {
+    const runs: Array<{ start: number; end: number }> = [];
+    const total = Math.min(sourceLines.length, translatedLines.length);
+    let start = -1;
+
+    for (let i = 0; i < total; i++) {
+      const unchanged = sourceLines[i] !== '' && sourceLines[i] === translatedLines[i];
+      if (unchanged) {
+        if (start === -1) start = i;
+        continue;
+      }
+
+      if (start !== -1) {
+        if (i - start >= 3) runs.push({ start, end: i });
+        start = -1;
+      }
+    }
+
+    if (start !== -1 && total - start >= 3) {
+      runs.push({ start, end: total });
+    }
+
+    return runs;
+  }
+
+  private async retranslateUntranslatedRun(
+    sourceLines: string[],
+  ): Promise<string[]> {
+    if (sourceLines.length === 0) return [];
+
+    const translated = await this.translateTomatoGoogle1(sourceLines.join('\n'), 3);
+    const lines = this.normalizeTranslationLines(translated);
+
+    if (lines.length === sourceLines.length) return lines;
+
+    if (sourceLines.length === 1) {
+      return lines.length ? [lines.join(' ')] : [''];
+    }
+
+    const mid = Math.floor(sourceLines.length / 2);
+    const [left, right] = await Promise.all([
+      this.retranslateUntranslatedRun(sourceLines.slice(0, mid)),
+      this.retranslateUntranslatedRun(sourceLines.slice(mid)),
+    ]);
+    return [...left, ...right];
+  }
+
+  private async repairTomatoUntranslatedRuns(
+    sourceText: string,
+    translatedText: string,
+  ): Promise<string> {
+    const sourceLines = this.normalizeTranslationLines(sourceText);
+    const translatedLines = this.normalizeTranslationLines(translatedText);
+
+    if (sourceLines.length === 0 || translatedLines.length !== sourceLines.length) {
+      return translatedText;
+    }
+
+    const repaired = [...translatedLines];
+    const runs = this.findUntranslatedRuns(sourceLines, translatedLines);
+
+    for (let i = runs.length - 1; i >= 0; i--) {
+      const run = runs[i];
+      const original = sourceLines.slice(run.start, run.end);
+      const retried = await this.retranslateUntranslatedRun(original);
+      if (retried.length === original.length) {
+        repaired.splice(run.start, original.length, ...retried);
+      }
+    }
+
+    return repaired.join('\n');
+  }
+
+  private async translateToEnglish(text: string): Promise<string> {
+    const filteredInput = text
+      .split('\n')
+      .filter((line) => line.trim() !== '')
+      .join('\n\n');
+
+    if (!filteredInput.trim()) return '';
+
+    const chunks = this.splitTomatoText(filteredInput, 1000);
+    const translatedChunks = await Promise.all(
+      chunks.map((chunk) => this.translateTomatoGoogle1(chunk, 3)),
+    );
+
+    const translated = translatedChunks.join('\n');
+    if (!translated.trim()) {
+      throw new Error('Translation service returned empty text.');
+    }
+
+    return this.repairTomatoUntranslatedRuns(filteredInput, translated);
   }
 
   async parseChapter(chapterPath: string): Promise<string> {

@@ -7,7 +7,7 @@ class FanqieRaw implements Plugin.PluginBase {
   id = 'fanqieraw';
   name = 'Fanqie Raw';
   site = 'https://fanqienovel.com';
-  version = '1.0.1';
+  version = '1.0.2';
   icon = 'src/zh/fanqieraw/icon.png';
 
   private readonly targetBookId = '7180279419959774247';
@@ -44,7 +44,7 @@ class FanqieRaw implements Plugin.PluginBase {
   }
 
   private bookId(path: string): string {
-    const match = path.match(/\/book\/(\d+)/);
+    const match = path.match(/\/(?:book|page)\/(\d+)/);
     if (!match) throw new Error(`Invalid Fanqie book path: ${path}`);
     return match[1];
   }
@@ -120,32 +120,45 @@ class FanqieRaw implements Plugin.PluginBase {
   }
 
   async popularNovels(): Promise<Plugin.NovelItem[]> {
-    return [];
+    return [{
+      name: this.englishTitle,
+      path: this.absolute(`/page/${this.targetBookId}`),
+    }];
   }
 
   async searchNovels(searchTerm: string, pageNo: number): Promise<Plugin.NovelItem[]> {
-    const page = Math.max(1, pageNo);
-    const response = await this.request(
-      this.absolute('/search') + `?keyword=${encodeURIComponent(searchTerm)}&page_num=${page}`,
-    );
-    if (!response.ok) throw new Error(`Fanqie search failed (HTTP ${response.status})`);
+    const query = searchTerm.trim();
+    if (!query) return this.popularNovels();
 
-    const $ = parseHTML(await response.text());
-    const novels: Plugin.NovelItem[] = [];
-    $('a[href*="/page/"]').each((_index, element) => {
-      const href = $(element).attr('href') ?? '';
-      const match = href.match(/\/page\/(\d+)/);
-      const name = $(element).text().replace(/\s+/g, ' ').trim();
-      if (!match || !name) return;
-      const path = this.absolute(`/page/${match[1]}`);
-      if (!novels.some((item) => item.path === path)) {
-        novels.push({
-          name: match[1] === this.targetBookId ? this.englishTitle : name,
-          path,
-        });
-      }
+    const offset = Math.max(0, pageNo - 1) * 10;
+    const url =
+      'https://novel.snssdk.com/api/novel/channel/homepage/search/search/v1/' +
+      `?device_platform=android&parent_enterfrom=novel_channel_search.tab.&offset=${offset}&aid=1967&q=${encodeURIComponent(query)}`;
+
+    const response = await this.request(url);
+    if (!response.ok) throw new Error(`Fanqie mobile search failed (HTTP ${response.status})`);
+
+    const body = await response.text();
+    let data: any;
+    try {
+      data = JSON.parse(body);
+    } catch {
+      throw new Error('Fanqie mobile search returned non-JSON data.');
+    }
+
+    const rows = data?.data?.ret_data ?? data?.ret_data ?? [];
+    if (!Array.isArray(rows)) return [];
+
+    return rows.flatMap((item: any) => {
+      const id = String(item?.book_id ?? item?.bookId ?? '');
+      const name = String(item?.title ?? item?.book_name ?? '').replace(/<[^>]*>/g, '').trim();
+      if (!id || !name) return [];
+      return [{
+        name: id === this.targetBookId ? this.englishTitle : name,
+        path: this.absolute(`/page/${id}`),
+        ...(item?.thumb_url ? { cover: String(item.thumb_url) } : {}),
+      }];
     });
-    return novels;
   }
 
   async parseNovel(novelPath: string): Promise<Plugin.SourceNovel> {

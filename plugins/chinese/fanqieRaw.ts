@@ -7,7 +7,7 @@ class FanqieRaw implements Plugin.PluginBase {
   id = 'fanqieraw';
   name = 'Fanqie Raw';
   site = 'https://fanqienovel.com';
-  version = '1.0.2';
+  version = '1.0.3';
   icon = 'src/zh/fanqieraw/icon.png';
 
   private readonly targetBookId = '7180279419959774247';
@@ -60,13 +60,66 @@ class FanqieRaw implements Plugin.PluginBase {
 
   private cleanChapterText(value: string): string {
     return value
-      .replace(/\r\n?/g, '\n')
-      .replace(/\u00a0/g, ' ')
-      .split('\n')
+      .replace(/\\r\\n?/g, '\\n')
+      .replace(/\\u00a0/g, ' ')
+      .split('\\n')
       .map((line) => line.trim())
       .filter((line) => line.length > 0)
-      .join('\n')
+      .join('\\n')
       .trim();
+  }
+
+  private async parseInitialState(html: string): Promise<any | undefined> {
+    const $ = parseHTML(html);
+    const scripts: string[] = [];
+    $('script').each((_i, el) => {
+      const content = $(el).html() || '';
+      if (content.includes('__INITIAL_STATE__')) scripts.push(content);
+    });
+    for (const script of scripts) {
+      const match = script.match(/__INITIAL_STATE__\\s*=\\s*(\\{[\\s\\S]*?\\})\\s*;?\\s*(?:window\\.|<\\/script|$)/);
+      if (match) {
+        try { return JSON.parse(match[1]); } catch { /* try next known shape */ }
+      }
+      const jsonMatch = script.match(/__INITIAL_STATE__\\s*=\\s*(\\{[\\s\\S]*\\})\\s*;?$/);
+      if (jsonMatch) {
+        try { return JSON.parse(jsonMatch[1]); } catch { /* ignore malformed state */ }
+      }
+    }
+    return undefined;
+  }
+
+  private findObjects(root: any, predicate: (value: any) => boolean): any[] {
+    const found: any[] = [];
+    const seen = new Set<any>();
+    const visit = (value: any, depth: number) => {
+      if (!value || typeof value !== 'object' || depth > 12 || seen.has(value)) return;
+      seen.add(value);
+      if (predicate(value)) found.push(value);
+      if (Array.isArray(value)) value.forEach((child) => visit(child, depth + 1));
+      else Object.keys(value).forEach((key) => visit(value[key], depth + 1));
+    };
+    visit(root, 0);
+    return found;
+  }
+
+  private async fetchBookMetadata(bookId: string): Promise<any> {
+    try {
+      const response = await this.request(this.absolute(`/page/${bookId}`));
+      if (!response.ok) return {};
+      const html = await response.text();
+      const state = await this.parseInitialState(html);
+      const candidates = this.findObjects(state, (item) =>
+        Boolean(item && (item.bookId === bookId || item.book_id === bookId) &&
+        (item.bookName || item.book_name || item.author || item.thumbUri || item.thumb_url))
+      );
+      return candidates.sort((a, b) =>
+        Number(Boolean(b.author || b.author_name)) - Number(Boolean(a.author || a.author_name)) +
+        Number(Boolean(b.thumbUri || b.thumb_url || b.book_cover)) - Number(Boolean(a.thumbUri || a.thumb_url || a.book_cover))
+      )[0] || {};
+    } catch {
+      return {};
+    }
   }
 
   private async fetchDirectory(bookId: string): Promise<any> {
@@ -79,44 +132,81 @@ class FanqieRaw implements Plugin.PluginBase {
   private extractDirectoryItems(data: any): any[] {
     const grouped = data?.data?.chapterListWithVolume;
     if (Array.isArray(grouped)) {
-      return grouped.flatMap((volume: any) => Array.isArray(volume) ? volume : []);
+      const flatten = (value: any): any[] => {
+        if (Array.isArray(value)) return value.flatMap(flatten);
+        if (value && typeof value === 'object' && (value.itemId || value.item_id)) return [value];
+        if (value && typeof value === 'object') {
+          for (const key of ['itemList', 'item_list', 'chapterList', 'chapter_list', 'items', 'chapters']) {
+            if (Array.isArray(value[key])) return value[key].flatMap(flatten);
+          }
+        }
+        return [];
+      };
+      return grouped.flatMap(flatten);
     }
     const flat = data?.data?.item_data_list;
     return Array.isArray(flat) ? flat : [];
   }
 
-  private async fetchChapterContent(itemId: string): Promise<string> {
-    const apiUrl =
-      this.absolute('/api/reader/chapter/content') +
-      `?book_id=${encodeURIComponent(this.targetBookId)}&item_id=${encodeURIComponent(itemId)}`;
-
-    const response = await this.request(apiUrl);
-    if (response.ok) {
-      const data = await response.json();
-      const candidates = [
-        data?.data?.chapterData?.content,
-        data?.data?.content,
-        data?.chapterData?.content,
-        data?.content,
-      ];
-      for (const candidate of candidates) {
-        if (typeof candidate === 'string' && candidate.trim()) return candidate;
+  private async fetchChapterContent(itemId: string, bookId = this.targetBookId): Promise<string> {
+    // This endpoint is confirmed by a successful Fanqie browser recording.
+    const fullUrl = this.absolute('/api/reader/full') + `?itemId=${encodeURIComponent(itemId)}`;
+    try {
+      const response = await this.request(fullUrl);
+      if (response.ok) {
+        const data = await response.json();
+        const content = data?.data?.chapterData?.content;
+        if (typeof content === 'string' && content.trim()) return content;
       }
-    }
+    } catch { /* continue to compatibility endpoints */ }
+
+    const apiUrl = this.absolute('/api/reader/chapter/content') +
+      `?book_id=${encodeURIComponent(bookId)}&item_id=${encodeURIComponent(itemId)}`;
+    try {
+      const response = await this.request(apiUrl);
+      if (response.ok) {
+        const data = await response.json();
+        const candidates = [data?.data?.chapterData?.content, data?.data?.content, data?.chapterData?.content, data?.content];
+        for (const candidate of candidates) {
+          if (typeof candidate === 'string' && candidate.trim()) return candidate;
+        }
+      }
+    } catch { /* try reader HTML */ }
 
     const reader = await this.request(this.absolute(`/reader/${itemId}`));
     if (!reader.ok) throw new Error(`Fanqie chapter failed (HTTP ${reader.status})`);
-
     const html = await reader.text();
     const $ = parseHTML(html);
+    const state = await this.parseInitialState(html);
+    const stateContent = this.findObjects(state, (item) =>
+      typeof item?.content === 'string' && item.content.trim().length > 0 &&
+      (item.itemId === itemId || item.item_id === itemId || item.chapterData === item)
+    )[0]?.content;
+    if (typeof stateContent === 'string' && stateContent.trim()) return stateContent;
+
     const paragraphs: string[] = [];
-    $('.muye-reader-content p').each((_index, element) => {
+    $('.muye-reader-content p, .reader-content p, .chapter-content p, [class*="reader"] p').each((_index, element) => {
       const text = $(element).text().trim();
       if (text) paragraphs.push(text);
     });
-    if (paragraphs.length) return paragraphs.join('\n');
+    if (paragraphs.length) return paragraphs.map((p) => `<p>${this.escapeHtml(p)}</p>`).join('');
+    throw new Error('Fanqie did not return readable chapter text. The full-reader API and page-state fallbacks were unsuccessful.');
+  }
 
-    throw new Error('Fanqie did not return readable chapter text. The source may require a session or its reader format may have changed.');
+  private contentToParagraphs(content: string): string[] {
+    const $ = parseHTML(`<div id="fanqie-content">${content}</div>`);
+    const root = $('#fanqie-content');
+    const paragraphNodes = root.find('p');
+    if (paragraphNodes.length) {
+      const paragraphs: string[] = [];
+      paragraphNodes.each((_i, el) => {
+        const text = this.cleanChapterText($(el).text());
+        if (text) paragraphs.push(text);
+      });
+      if (paragraphs.length) return paragraphs;
+    }
+    const plain = this.cleanChapterText(root.text() || content.replace(/<[^>]*>/g, '\\n'));
+    return plain.split('\\n').map((line) => line.trim()).filter(Boolean);
   }
 
   async popularNovels(): Promise<Plugin.NovelItem[]> {
@@ -167,7 +257,7 @@ class FanqieRaw implements Plugin.PluginBase {
     const items = this.extractDirectoryItems(directory);
     if (!items.length) throw new Error('Fanqie returned an empty chapter directory.');
 
-    const bookInfo = directory?.data?.book_info ?? directory?.data?.bookInfo;
+    const bookInfo = directory?.data?.book_info ?? directory?.data?.bookInfo ?? await this.fetchBookMetadata(id);
     const chapters: Plugin.ChapterItem[] = [];
 
     for (let i = 0; i < items.length; i++) {
@@ -195,9 +285,9 @@ class FanqieRaw implements Plugin.PluginBase {
     }
 
     const rawTitle = String(bookInfo?.book_name ?? bookInfo?.bookName ?? '').trim();
-    const author = String(bookInfo?.author ?? bookInfo?.author_name ?? '').trim();
-    const summary = String(bookInfo?.abstract ?? bookInfo?.book_abstract_v2 ?? bookInfo?.description ?? '').trim();
-    const cover = String(bookInfo?.thumb_url ?? bookInfo?.book_cover ?? '').trim();
+    const author = String(bookInfo?.author ?? bookInfo?.author_name ?? bookInfo?.authorName ?? '').trim();
+    const summary = String(bookInfo?.abstract ?? bookInfo?.book_abstract_v2 ?? bookInfo?.description ?? bookInfo?.bookAbstract ?? '').trim();
+    const cover = String(bookInfo?.thumbUri ?? bookInfo?.thumb_url ?? bookInfo?.book_cover ?? bookInfo?.cover ?? '').trim();
 
     return {
       path: this.absolute(`/page/${id}`),
@@ -211,21 +301,13 @@ class FanqieRaw implements Plugin.PluginBase {
   }
 
   async parseChapter(chapterPath: string): Promise<string> {
-    const match = chapterPath.match(/\/reader\/(\d+)/);
+    const match = chapterPath.match(/\\/reader\\/(\\d+)/);
     if (!match) throw new Error(`Invalid Fanqie chapter path: ${chapterPath}`);
-
-    const text = this.cleanChapterText(await this.fetchChapterContent(match[1]));
-    if (!text) throw new Error('Fanqie returned an empty chapter.');
-
-    // Preserve normal paragraph separation. LNReader's reader controls
-    // line height and paragraph spacing, so we use <p> for each source
-    // paragraph instead of forcing everything into one continuous block.
-    const paragraphs = text
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .map((line) => `<p>${this.escapeHtml(line)}</p>`);
-    return `<div>${paragraphs.join('')}</div>`;
+    const bookMatch = chapterPath.match(/[?&]bookId=(\\d+)/);
+    const content = await this.fetchChapterContent(match[1], bookMatch?.[1] || this.targetBookId);
+    const paragraphs = this.contentToParagraphs(content);
+    if (!paragraphs.length) throw new Error('Fanqie returned an empty chapter.');
+    return `<div>${paragraphs.map((paragraph) => `<p>${this.escapeHtml(paragraph)}</p>`).join('')}</div>`;
   }
 
   resolveUrl = (path: string) => path;

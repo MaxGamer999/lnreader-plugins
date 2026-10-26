@@ -9,11 +9,37 @@ class TomatoMTL implements Plugin.PluginBase {
   id = 'tomatomtl';
   name = 'TomatoMTL';
   site = 'https://tomatomtl.com';
-  version = '1.0.8';
+  version = '1.0.9';
   icon = 'src/en/tomatomtl/icon.png';
   // TomatoMTL uses browser storage for its catalogue cache. Keeping this flag
   // enabled also makes the source compatible with LNReader's web-backed flow.
   webStorageUtilized = true;
+
+  // Editable inside LN Reader: Settings icon on the TomatoMTL source page.
+  // These mirror TomatoMTL's own "Glossary" (applied before translation) and
+  // "Replacement" (applied after translation) features, which live in the
+  // website account/browser and so can't be read by the plugin.
+  pluginSettings = {
+    glossary: {
+      value: '',
+      label:
+        'Glossary, applied BEFORE translation. One per line: 中文=English',
+      type: 'Text' as const,
+    },
+    replacements: {
+      value: '',
+      label:
+        'Replacements, applied AFTER translation. One per line: found=>replacement',
+      type: 'Text' as const,
+    },
+  };
+
+  // Built-in rules, same formats as the settings above. Add permanent entries
+  // here if you prefer to keep them in the repo, e.g.
+  //   builtInGlossary = [['张毅', 'Zhang Yi']];
+  //   builtInReplacements = [['Zhang Yi\'s', 'Zhang Yi’s']];
+  private readonly builtInGlossary: Array<[string, string]> = [];
+  private readonly builtInReplacements: Array<[string, string]> = [];
 
   private chapterQueue: Promise<void> = Promise.resolve();
   private lastChapterFinishedAt = 0;
@@ -927,6 +953,58 @@ class TomatoMTL implements Plugin.PluginBase {
     }
   }
 
+  private readSetting(key: string): string {
+    try {
+      const value = storage.get(key);
+      return typeof value === 'string' ? value : '';
+    } catch {
+      return '';
+    }
+  }
+
+  private parseRules(raw: string, separator: string): Array<[string, string]> {
+    const rules: Array<[string, string]> = [];
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const index = trimmed.indexOf(separator);
+      if (index <= 0) continue;
+      const from = trimmed.slice(0, index).trim();
+      const to = trimmed.slice(index + separator.length).trim();
+      if (from) rules.push([from, to]);
+    }
+    return rules;
+  }
+
+  // Glossary: swap Chinese terms for their English form before Google sees
+  // the text. Longest terms first so "张毅的" wins over "张毅".
+  private applyGlossary(text: string): string {
+    const rules = [
+      ...this.builtInGlossary,
+      ...this.parseRules(this.readSetting('glossary'), '='),
+    ].sort((a, b) => b[0].length - a[0].length);
+
+    let result = text;
+    for (const [from, to] of rules) {
+      result = result.split(from).join(to);
+    }
+    return result;
+  }
+
+  // Replacements: edit the English output, in the order they are listed.
+  private applyReplacements(text: string): string {
+    const rules = [
+      ...this.builtInReplacements,
+      ...this.parseRules(this.readSetting('replacements'), '=>'),
+    ];
+
+    let result = text;
+    for (const [from, to] of rules) {
+      result = result.split(from).join(to);
+    }
+    return result;
+  }
+
   private async parseChapterNow(chapterPath: string): Promise<string> {
     const url = this.absolute(chapterPath);
     const response = await this.request(url);
@@ -942,11 +1020,15 @@ class TomatoMTL implements Plugin.PluginBase {
     const rawText = this.decryptChapter(html);
     if (!rawText.trim()) throw new Error('TomatoMTL returned an empty chapter.');
 
-    const english = await this.translateToEnglish(rawText);
-    if (!english.trim()) throw new Error('TomatoMTL chapter translation was empty.');
+    const glossaryText = this.applyGlossary(rawText);
+    const translated = await this.translateToEnglish(glossaryText);
+    if (!translated.trim()) throw new Error('TomatoMTL chapter translation was empty.');
+
+    const english = this.applyReplacements(translated);
 
     return english
       .split(/\n+/)
+      .filter((line) => line.trim() !== '')
       .map((line) => `<p>${this.escapeHTML(line)}</p>`)
       .join('');
   }

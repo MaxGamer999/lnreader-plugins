@@ -60,12 +60,12 @@ class FanqieRaw implements Plugin.PluginBase {
 
   private cleanChapterText(value: string): string {
     return value
-      .replace(/\\r\\n?/g, '\\n')
-      .replace(/\\u00a0/g, ' ')
-      .split('\\n')
+      .replace(/\r\n?/g, '\n')
+      .replace(/\u00a0/g, ' ')
+      .split('\n')
       .map((line) => line.trim())
       .filter((line) => line.length > 0)
-      .join('\\n')
+      .join('\n')
       .trim();
   }
 
@@ -77,11 +77,11 @@ class FanqieRaw implements Plugin.PluginBase {
       if (content.includes('__INITIAL_STATE__')) scripts.push(content);
     });
     for (const script of scripts) {
-      const match = script.match(/__INITIAL_STATE__\\s*=\\s*(\\{[\\s\\S]*?\\})\\s*;?\\s*(?:window\\.|<\\/script|$)/);
+      const match = script.match(/__INITIAL_STATE__\s*=\s*(\{[\s\S]*?\})\s*;?\s*(?:window\.|<\/script|$)/);
       if (match) {
         try { return JSON.parse(match[1]); } catch { /* try next known shape */ }
       }
-      const jsonMatch = script.match(/__INITIAL_STATE__\\s*=\\s*(\\{[\\s\\S]*\\})\\s*;?$/);
+      const jsonMatch = script.match(/__INITIAL_STATE__\s*=\s*(\{[\s\S]*\})\s*;?$/);
       if (jsonMatch) {
         try { return JSON.parse(jsonMatch[1]); } catch { /* ignore malformed state */ }
       }
@@ -205,8 +205,8 @@ class FanqieRaw implements Plugin.PluginBase {
       });
       if (paragraphs.length) return paragraphs;
     }
-    const plain = this.cleanChapterText(root.text() || content.replace(/<[^>]*>/g, '\\n'));
-    return plain.split('\\n').map((line) => line.trim()).filter(Boolean);
+    const plain = this.cleanChapterText(root.text() || content.replace(/<[^>]*>/g, '\n'));
+    return plain.split('\n').map((line) => line.trim()).filter(Boolean);
   }
 
   async popularNovels(): Promise<Plugin.NovelItem[]> {
@@ -301,9 +301,9 @@ class FanqieRaw implements Plugin.PluginBase {
   }
 
   async parseChapter(chapterPath: string): Promise<string> {
-    const match = chapterPath.match(/\\/reader\\/(\\d+)/);
+    const match = chapterPath.match(/\/reader\/(\d+)/);
     if (!match) throw new Error(`Invalid Fanqie chapter path: ${chapterPath}`);
-    const bookMatch = chapterPath.match(/[?&]bookId=(\\d+)/);
+    const bookMatch = chapterPath.match(/[?&]bookId=(\d+)/);
     const content = await this.fetchChapterContent(match[1], bookMatch?.[1] || this.targetBookId);
     const paragraphs = this.contentToParagraphs(content);
     if (!paragraphs.length) throw new Error('Fanqie returned an empty chapter.');

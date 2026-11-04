@@ -559,4 +559,572 @@ class TomatoMTL implements Plugin.PluginBase {
     }
 
     const data = await response.json();
-    cons
+    const result = typeof data?.translation === 'string' ? data.translation : '';
+    if (!result.trim()) throw new Error('Translation service returned empty text.');
+    return result.trim();
+  }
+
+  private async translateHtmlTexts(texts: string[], maxRetries = 3): Promise<string[]> {
+    if (texts.length === 0) return [];
+    await this.loadTomatoGoogleKeys();
+
+    const body = JSON.stringify([[[...texts], 'zh-CN', 'en'], 'te']);
+    const headers = {
+      'Content-Type': 'application/json+protobuf',
+      'x-goog-api-key': this.tomatoGoogleHtmlKey!,
+    };
+
+    let response = await this.request(
+      'https://translate-pa.googleapis.com/v1/translateHtml',
+      { method: 'POST', headers, body },
+      maxRetries,
+      'omit',
+    );
+
+    if (response.status === 400 || response.status === 401 || response.status === 403) {
+      await this.loadTomatoGoogleKeys(true);
+      response = await this.request(
+        'https://translate-pa.googleapis.com/v1/translateHtml',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json+protobuf',
+            'x-goog-api-key': this.tomatoGoogleHtmlKey!,
+          },
+          body,
+        },
+        maxRetries,
+        'omit',
+      );
+    }
+
+    if (!response.ok) {
+      throw new Error(`Translation service failed (HTTP ${response.status})`);
+    }
+
+    const data = await response.json();
+    if (!Array.isArray(data?.[0])) {
+      throw new Error('Translation service returned an unexpected response.');
+    }
+
+    return data[0].map((value: unknown) => String(value ?? '').trim());
+  }
+
+  private async translateChapterTitles(titles: string[]): Promise<string[]> {
+    const cached = this.readJsonStorage<Record<string, string>>(this.chapterTitleCacheKey, {});
+    const result = titles.map((title) => cached[title] || '');
+    const missingIndexes = titles
+      .map((title, index) => (!cached[title] ? index : -1))
+      .filter((index) => index >= 0);
+
+    // TomatoMTL translates chapter titles through translateHtml. We batch a
+    // modest number of titles per request to avoid thousands of requests while
+    // keeping the same translation engine.
+    const batchSize = 20;
+    for (let start = 0; start < missingIndexes.length; start += batchSize) {
+      const indexes = missingIndexes.slice(start, start + batchSize);
+      try {
+        const translated = await this.translateHtmlTexts(indexes.map((index) => titles[index]), 4);
+        if (translated.length === indexes.length) {
+          for (let i = 0; i < indexes.length; i++) {
+            const value = translated[i];
+            if (value) {
+              cached[titles[indexes[i]]] = value;
+              result[indexes[i]] = value;
+            }
+          }
+        }
+      } catch {
+        // Keep the original Chinese title for a failed batch. The chapter
+        // itself remains fully downloadable and translatable.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+    }
+
+    this.writeJsonStorage(this.chapterTitleCacheKey, cached);
+    return result.map((value, index) => value || titles[index]);
+  }
+
+  private base64Bytes(value: string): Uint8Array {
+    // React Native/browser runtimes do not guarantee Node's Buffer global.
+    // atob is available in LNReader's runtime and matches TomatoMTL's own
+    // browser-side Base64 handling.
+    const binary = atob(value);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+
+  // TomatoMTL uses AES-128-CBC with PKCS#7 padding. LNReader's Android
+  // runtime can occasionally have trouble executing the bundled AES primitive,
+  // so this plugin keeps a small pure-TypeScript AES-128 fallback. We first use
+  // the normal @noble/ciphers implementation and fall back only if its output
+  // is invalid. This avoids relying on a native/WebCrypto implementation.
+  private aesSBox = new Uint8Array([
+    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16,
+  ]);
+
+  private aesInvSBox = (() => {
+    const inv = new Uint8Array(256);
+    for (let i = 0; i < 256; i++) inv[this.aesSBox[i]] = i;
+    return inv;
+  })();
+
+  private aesRcon = [0, 1, 2, 4, 8, 16, 32, 64, 128, 27, 54];
+
+  private aesExpandKey(key: Uint8Array): Uint8Array {
+    const expanded = new Uint8Array(176);
+    expanded.set(key);
+    let generated = 16;
+    let round = 1;
+    while (generated < 176) {
+      let temp = [
+        expanded[generated - 4],
+        expanded[generated - 3],
+        expanded[generated - 2],
+        expanded[generated - 1],
+      ];
+      if (generated % 16 === 0) {
+        temp = [temp[1], temp[2], temp[3], temp[0]];
+        temp = temp.map((value) => this.aesSBox[value]);
+        temp[0] ^= this.aesRcon[round++];
+      }
+      for (let i = 0; i < 4; i++) {
+        expanded[generated] = expanded[generated - 16] ^ temp[i];
+        generated++;
+      }
+    }
+    return expanded;
+  }
+
+  private aesMul(a: number, b: number): number {
+    let result = 0;
+    for (let i = 0; i < 8; i++) {
+      if (b & 1) result ^= a;
+      const high = a & 0x80;
+      a = (a << 1) & 0xff;
+      if (high) a ^= 0x1b;
+      b >>>= 1;
+    }
+    return result;
+  }
+
+  private aesDecryptBlock(block: Uint8Array, key: Uint8Array): Uint8Array {
+    const expanded = this.aesExpandKey(key);
+    const state = Uint8Array.from(block);
+
+    const addRoundKey = (round: number) => {
+      const offset = round * 16;
+      for (let i = 0; i < 16; i++) state[i] ^= expanded[offset + i];
+    };
+
+    const invShiftRows = () => {
+      const copy = state.slice();
+      for (let row = 1; row < 4; row++) {
+        for (let col = 0; col < 4; col++) {
+          state[4 * col + row] = copy[4 * ((col - row + 4) % 4) + row];
+        }
+      }
+    };
+
+    const invSubBytes = () => {
+      for (let i = 0; i < 16; i++) state[i] = this.aesInvSBox[state[i]];
+    };
+
+    const invMixColumns = () => {
+      for (let col = 0; col < 4; col++) {
+        const i = col * 4;
+        const a0 = state[i];
+        const a1 = state[i + 1];
+        const a2 = state[i + 2];
+        const a3 = state[i + 3];
+        state[i] = this.aesMul(a0, 14) ^ this.aesMul(a1, 11) ^ this.aesMul(a2, 13) ^ this.aesMul(a3, 9);
+        state[i + 1] = this.aesMul(a0, 9) ^ this.aesMul(a1, 14) ^ this.aesMul(a2, 11) ^ this.aesMul(a3, 13);
+        state[i + 2] = this.aesMul(a0, 13) ^ this.aesMul(a1, 9) ^ this.aesMul(a2, 14) ^ this.aesMul(a3, 11);
+        state[i + 3] = this.aesMul(a0, 11) ^ this.aesMul(a1, 13) ^ this.aesMul(a2, 9) ^ this.aesMul(a3, 14);
+      }
+    };
+
+    addRoundKey(10);
+    for (let round = 9; round >= 1; round--) {
+      invShiftRows();
+      invSubBytes();
+      addRoundKey(round);
+      invMixColumns();
+    }
+    invShiftRows();
+    invSubBytes();
+    addRoundKey(0);
+    return state;
+  }
+
+  private aesCbcDecrypt(ciphertext: Uint8Array, key: Uint8Array, iv: Uint8Array): Uint8Array {
+    if (key.length !== 16 || iv.length !== 16 || ciphertext.length === 0 || ciphertext.length % 16 !== 0) {
+      throw new Error('Invalid AES-128-CBC data.');
+    }
+    const plaintext = new Uint8Array(ciphertext.length);
+    let previous = iv;
+    for (let offset = 0; offset < ciphertext.length; offset += 16) {
+      const block = ciphertext.slice(offset, offset + 16);
+      const decrypted = this.aesDecryptBlock(block, key);
+      for (let i = 0; i < 16; i++) plaintext[offset + i] = decrypted[i] ^ previous[i];
+      previous = block;
+    }
+    return plaintext;
+  }
+
+  private validPkcs7(bytes: Uint8Array): boolean {
+    if (bytes.length === 0) return false;
+    const padding = bytes[bytes.length - 1];
+    if (padding < 1 || padding > 16 || padding > bytes.length) return false;
+    for (let i = bytes.length - padding; i < bytes.length; i++) {
+      if (bytes[i] !== padding) return false;
+    }
+    return true;
+  }
+
+  private decryptChapter(html: string): string {
+    const keyMatch = html.match(
+      /(?:const|let|var)\s+unlock_code\s*=\s*("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/,
+    );
+    const dataMatch = html.match(
+      /(?:const|let|var)\s+encryptedData\s*=\s*(\{[\s\S]*?\});\s*(?:const|let|var)\s+txt_content/,
+    );
+
+    if (!keyMatch || !dataMatch) {
+      throw new Error(
+        'TomatoMTL did not provide encrypted chapter data. You may need to log in to TomatoMTL.',
+      );
+    }
+
+    let unlockCode: string;
+    try {
+      unlockCode = JSON.parse(keyMatch[1]);
+    } catch {
+      unlockCode = keyMatch[1].slice(1, -1).replace(/\\(['\\"])/g, '$1');
+    }
+
+    const encryptedData = JSON.parse(dataMatch[1]);
+    const key = this.base64Bytes(unlockCode).slice(0, 16);
+    const iv = this.base64Bytes(encryptedData.iv);
+    const ciphertext = this.base64Bytes(encryptedData.enc);
+
+    let plaintext: Uint8Array | undefined;
+
+    // Prefer noble-ciphers, then use the pure-JS implementation if the Android
+    // runtime rejects the cipher operation or produces invalid PKCS#7 padding.
+    try {
+      const candidate = cbc(key, iv).decrypt(ciphertext);
+      if (this.validPkcs7(candidate)) plaintext = candidate;
+    } catch {
+      // Fall through to the runtime-independent AES implementation below.
+    }
+
+    if (!plaintext) {
+      try {
+        const candidate = this.aesCbcDecrypt(ciphertext, key, iv);
+        if (this.validPkcs7(candidate)) plaintext = candidate;
+      } catch {
+        // handled below
+      }
+    }
+
+    if (!plaintext) throw new Error('TomatoMTL chapter decryption failed.');
+
+    const padding = plaintext[plaintext.length - 1];
+    const content = plaintext.slice(0, plaintext.length - padding);
+    try {
+      return new TextDecoder().decode(content);
+    } catch {
+      throw new Error('TomatoMTL decrypted the chapter but could not decode its text.');
+    }
+  }
+
+  /**
+   * Reproduce TomatoMTL's current Google chapter-translation pipeline as
+   * closely as possible.
+   *
+   * TomatoMTL does NOT simply translate the decrypted string as-is. Its
+   * client first removes blank lines, rejoins paragraphs with double newlines,
+   * splits with the same line-aware 1000-character helper, then sends each
+   * chunk to /v1/translate. It also retries translation when Google leaves a
+   * run of source lines unchanged.
+   */
+  private splitTomatoText(text: string, maxLength: number): string[] {
+    const lines = text
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+
+    const chunks: string[] = [];
+    let current = '';
+
+    for (const line of lines) {
+      const separator = current ? '\n' : '';
+      if (current.length + separator.length + line.length < maxLength) {
+        current += separator + line;
+      } else {
+        if (current) chunks.push(current);
+        current = line;
+      }
+    }
+
+    if (current) chunks.push(current);
+    return chunks;
+  }
+
+  private async translateTomatoGoogle1(text: string, maxRetries = 3): Promise<string> {
+    // TomatoMTL's translateGoogle1() converts each paragraph separator to a
+    // double newline before calling fetchTranslateGoogle1().
+    const input = text
+      .split('\n')
+      .filter((line) => line.trim() !== '')
+      .join('\n\n');
+
+    if (!input.trim()) return '';
+
+    if (this.readEngine() === 1) return this.translateText(input, maxRetries);
+
+    try {
+      return await this.translateEngine2(input, maxRetries);
+    } catch {
+      // Engine 2 failed (blocked or empty): fall back to engine 1.
+      return this.translateText(input, maxRetries);
+    }
+  }
+
+  private normalizeTranslationLines(text: string): string[] {
+    return text
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line !== '');
+  }
+
+  private findUntranslatedRuns(sourceLines: string[], translatedLines: string[]) {
+    const runs: Array<{ start: number; end: number }> = [];
+    const total = Math.min(sourceLines.length, translatedLines.length);
+    let start = -1;
+
+    for (let i = 0; i < total; i++) {
+      const unchanged = sourceLines[i] !== '' && sourceLines[i] === translatedLines[i];
+      if (unchanged) {
+        if (start === -1) start = i;
+        continue;
+      }
+
+      if (start !== -1) {
+        if (i - start >= 3) runs.push({ start, end: i });
+        start = -1;
+      }
+    }
+
+    if (start !== -1 && total - start >= 3) {
+      runs.push({ start, end: total });
+    }
+
+    return runs;
+  }
+
+  private async retranslateUntranslatedRun(
+    sourceLines: string[],
+  ): Promise<string[]> {
+    if (sourceLines.length === 0) return [];
+
+    const translated = await this.translateTomatoGoogle1(sourceLines.join('\n'), 3);
+    const lines = this.normalizeTranslationLines(translated);
+
+    if (lines.length === sourceLines.length) return lines;
+
+    if (sourceLines.length === 1) {
+      return lines.length ? [lines.join(' ')] : [''];
+    }
+
+    const mid = Math.floor(sourceLines.length / 2);
+    const [left, right] = await Promise.all([
+      this.retranslateUntranslatedRun(sourceLines.slice(0, mid)),
+      this.retranslateUntranslatedRun(sourceLines.slice(mid)),
+    ]);
+    return [...left, ...right];
+  }
+
+  private async repairTomatoUntranslatedRuns(
+    sourceText: string,
+    translatedText: string,
+  ): Promise<string> {
+    const sourceLines = this.normalizeTranslationLines(sourceText);
+    const translatedLines = this.normalizeTranslationLines(translatedText);
+
+    if (sourceLines.length === 0 || translatedLines.length !== sourceLines.length) {
+      return translatedText;
+    }
+
+    const repaired = [...translatedLines];
+    const runs = this.findUntranslatedRuns(sourceLines, translatedLines);
+
+    for (let i = runs.length - 1; i >= 0; i--) {
+      const run = runs[i];
+      const original = sourceLines.slice(run.start, run.end);
+      const retried = await this.retranslateUntranslatedRun(original);
+      if (retried.length === original.length) {
+        repaired.splice(run.start, original.length, ...retried);
+      }
+    }
+
+    return repaired.join('\n');
+  }
+
+  private async translateToEnglish(text: string): Promise<string> {
+    const filteredInput = text
+      .split('\n')
+      .filter((line) => line.trim() !== '')
+      .join('\n\n');
+
+    if (!filteredInput.trim()) return '';
+
+    const chunks = this.splitTomatoText(filteredInput, this.readChunkSize());
+    const translatedChunks = await Promise.all(
+      chunks.map((chunk) => this.translateTomatoGoogle1(chunk, 3)),
+    );
+
+    const translated = translatedChunks.join('\n');
+    if (!translated.trim()) {
+      throw new Error('Translation service returned empty text.');
+    }
+
+    return this.repairTomatoUntranslatedRuns(filteredInput, translated);
+  }
+
+  async parseChapter(chapterPath: string): Promise<string> {
+    const run = async () => {
+      const now = Date.now();
+      const spacing = 1500 - (now - this.lastChapterFinishedAt);
+      if (spacing > 0) await new Promise((resolve) => setTimeout(resolve, spacing));
+
+      try {
+        return await this.parseChapterNow(chapterPath);
+      } finally {
+        this.lastChapterFinishedAt = Date.now();
+      }
+    };
+
+    const previous = this.chapterQueue;
+    let release!: () => void;
+    this.chapterQueue = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await run();
+    } finally {
+      release();
+    }
+  }
+
+  private readSetting(key: string): string {
+    try {
+      const value = storage.get(key);
+      return typeof value === 'string' ? value : '';
+    } catch {
+      return '';
+    }
+  }
+
+  private parseRules(raw: string, separator: string): Array<[string, string]> {
+    const rules: Array<[string, string]> = [];
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const index = trimmed.indexOf(separator);
+      if (index <= 0) continue;
+      const from = trimmed.slice(0, index).trim();
+      const to = trimmed.slice(index + separator.length).trim();
+      if (from) rules.push([from, to]);
+    }
+    return rules;
+  }
+
+  // Glossary: swap Chinese terms for their English form before Google sees
+  // the text. Longest terms first so "张毅的" wins over "张毅".
+  private applyGlossary(text: string): string {
+    const rules = [
+      ...this.builtInGlossary,
+      ...this.parseRules(this.readSetting('glossary'), '='),
+    ].sort((a, b) => b[0].length - a[0].length);
+
+    let result = text;
+    for (const [from, to] of rules) {
+      result = result.split(from).join(to);
+    }
+    return result;
+  }
+
+  // Replacements: edit the English output, in the order they are listed.
+  private applyReplacements(text: string): string {
+    const rules = [
+      ...this.builtInReplacements,
+      ...this.parseRules(this.readSetting('replacements'), '=>'),
+    ];
+
+    let result = text;
+    for (const [from, to] of rules) {
+      result = result.split(from).join(to);
+    }
+    return result;
+  }
+
+  private async parseChapterNow(chapterPath: string): Promise<string> {
+    const url = this.absolute(chapterPath);
+    const response = await this.request(url);
+    const html = await response.text();
+
+    if (/You need to log in to read chapter content/i.test(html) ||
+        /const\s+isLoggedIn\s*=\s*false/i.test(html)) {
+      throw new Error(
+        'TomatoMTL requires a logged-in account to read chapters. Open TomatoMTL in LNReader\'s WebView, log in, then try the chapter again.',
+      );
+    }
+
+    const rawText = this.decryptChapter(html);
+    if (!rawText.trim()) throw new Error('TomatoMTL returned an empty chapter.');
+
+    const glossaryText = this.applyGlossary(rawText);
+    const translated = await this.translateToEnglish(glossaryText);
+    if (!translated.trim()) throw new Error('TomatoMTL chapter translation was empty.');
+
+    const english = this.applyReplacements(translated);
+
+    return english
+      .split(/\n+/)
+      .filter((line) => line.trim() !== '')
+      .map((line) => `<p>${this.escapeHTML(line)}</p>`)
+      .join('');
+  }
+
+  private escapeHTML(value: string): string {
+    return value
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  resolveUrl = (path: string) => this.absolute(path);
+}
+
+export default new TomatoMTL();
